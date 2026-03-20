@@ -1,0 +1,24 @@
+{
+  "name": "nekozane",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc -p tsconfig.tson",
+    "start": "node dist/index.js",
+    "register:commands": "tsx scripts/registerCommands.ts",
+    "register:metadata": "tsx scripts/registerMetadata.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "oceanic.js": "^1.11.2",
+    "ts-node": "^10.9.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}
