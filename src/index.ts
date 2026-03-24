@@ -1,27 +1,314 @@
 import express from "express";
-import { ActivityTypes, Client, CommandInteraction, Intents, InteractionTypes } from "oceanic.js";
+import {
+  ActivityTypes,
+  ChannelTypes,
+  Client,
+  CommandInteraction,
+  ComponentInteraction,
+  Intents,
+  InteractionTypes
+} from "oceanic.js";
 import { config } from "./config.ts";
 import { exchangeDiscordCode, getDiscordUser, updateRoleConnection } from "./discordOAuth.ts";
 import { exchangeGithubCode, getGithubUser, hasContributedToRepo } from "./github.ts";
+import {
+  closeThreadByChannelId,
+  getOpenThreadByChannelId,
+  getOpenThreadByUserId,
+  initializeModmailStore,
+  nextThreadId,
+  saveOpenThread
+} from "./modmailStore.ts";
 import { getOrCreateSession, randomState, saveSession } from "./sessionStore.ts";
+
+const DISCORD_API_BASE = "https://discord.com/api/v10";
+const CONFIRM_ACCEPT_ID = "modmail_accept";
+const CONFIRM_DENY_ID = "modmail_deny";
+
+type PendingDmMessage = {
+  userId: string;
+  username: string;
+  messages: Array<{
+    content: string;
+    attachments: Array<{ url: string; filename: string }>;
+  }>;
+};
+
+const pendingConfirmations = new Map<string, PendingDmMessage>();
 
 const client = new Client({
   auth: `Bot ${config.discordToken}`,
-  gateway: { intents: [Intents.GUILDS, Intents.GUILD_MEMBERS] }
+  gateway: {
+    intents: [
+      Intents.GUILDS,
+      Intents.GUILD_MEMBERS,
+      Intents.GUILD_MESSAGES,
+      Intents.DIRECT_MESSAGES,
+      Intents.MESSAGE_CONTENT
+    ]
+  }
 });
 
-client.once("ready", () => {
-  client.editStatus("online", [{ name: "your smile (ღゝ◡╹)ノ♡", type: ActivityTypes.WATCHING }])
+function createEmbed(title: string, description: string) {
+  return {
+    title,
+    description,
+    color: 0x9b87f5,
+    timestamp: new Date().toISOString()
+  };
+}
 
+async function discordRequest(path: string, init: RequestInit): Promise<Response> {
+  return fetch(`${DISCORD_API_BASE}${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bot ${config.discordToken}`,
+      "Content-Type": "application/json",
+      ...(init.headers ?? {})
+    }
+  });
+}
+
+async function createDmChannel(userId: string): Promise<string> {
+  const response = await discordRequest("/users/@me/channels", {
+    method: "POST",
+    body: JSON.stringify({ recipient_id: userId })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to create DM channel (${response.status}): ${await response.text()}`);
+  }
+
+  const json = (await response.json()) as { id: string };
+  return json.id;
+}
+
+async function sendChannelMessage(channelId: string, body: Record<string, unknown>): Promise<void> {
+  const response = await discordRequest(`/channels/${channelId}/messages`, {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to send message (${response.status}): ${await response.text()}`);
+  }
+}
+
+async function sendUserEmbed(userId: string, title: string, description: string): Promise<void> {
+  const dmChannelId = await createDmChannel(userId);
+  await sendChannelMessage(dmChannelId, { embeds: [createEmbed(title, description)] });
+}
+
+async function createModmailChannel(userId: string, username: string, threadNumber: number): Promise<string> {
+  const safeName = username.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").slice(0, 30) || "user";
+  const channelName = `thread-${String(threadNumber).padStart(4, "0")}-${safeName}`;
+
+  const response = await discordRequest(`/guilds/${config.guildId}/channels`, {
+    method: "POST",
+    body: JSON.stringify({
+      name: channelName,
+      type: ChannelTypes.GUILD_TEXT,
+      parent_id: config.modmailCategoryId,
+      topic: `Modmail thread #${threadNumber} | User ID: ${userId}`
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to create thread channel (${response.status}): ${await response.text()}`);
+  }
+
+  const json = (await response.json()) as { id: string };
+  return json.id;
+}
+
+function buildForwardEmbed(authorTag: string, userId: string, content: string, attachments: Array<{ url: string; filename: string }>) {
+  const attachmentText = attachments.length > 0
+    ? attachments.map((file) => `[${file.filename}](${file.url})`).join("\n")
+    : "None";
+
+  return {
+    ...createEmbed(`Message from ${authorTag}`, content || "(no text content)"),
+    fields: [
+      { name: "User ID", value: userId, inline: true },
+      { name: "Attachments", value: attachmentText, inline: false }
+    ]
+  };
+}
+
+function buildStaffReplyEmbed(content: string) {
+  return createEmbed("Staff Reply", content);
+}
+
+async function forwardUserMessageToThread(userId: string, username: string, content: string, attachments: Array<{ url: string; filename: string }>) {
+  let thread = await getOpenThreadByUserId(userId);
+
+  if (!thread) {
+    const threadId = await nextThreadId();
+    const channelId = await createModmailChannel(userId, username, threadId);
+    thread = await saveOpenThread(userId, channelId, threadId);
+
+    await sendChannelMessage(channelId, {
+      embeds: [createEmbed("New Modmail Thread", `Thread #${thread.id} opened for <@${userId}> (${username}).`)]
+    });
+  }
+
+  await sendChannelMessage(thread.channelId, {
+    embeds: [buildForwardEmbed(username, userId, content, attachments)]
+  });
+}
+
+async function handleReplyCommand(interaction: CommandInteraction): Promise<void> {
+
+  const thread = await getOpenThreadByChannelId(interaction.channelID);
+  if (!thread) {
+    await interaction.createMessage({ embeds: [createEmbed("Modmail", "This command can only be used inside an open modmail channel.")], flags: 64 });
+    return;
+  }
+
+  const reply = interaction.data.options.getString("message");
+  if (!reply) {
+    await interaction.createMessage({ embeds: [createEmbed("Modmail", "Please provide a reply message.")], flags: 64 });
+    return;
+  }
+
+  await sendUserEmbed(thread.userId, "Staff Reply", reply);
+  await interaction.createMessage({ embeds: [createEmbed("Reply Sent", "Your reply has been delivered to the user.")], flags: 64 });
+  await sendChannelMessage(interaction.channelID, { embeds: [buildStaffReplyEmbed(reply)] });
+}
+
+async function handleCloseCommand(interaction: CommandInteraction): Promise<void> {
+  const thread = await getOpenThreadByChannelId(interaction.channelID);
+  if (!thread) {
+    await interaction.createMessage({ embeds: [createEmbed("Modmail", "This command can only be used inside an open modmail channel.")], flags: 64 });
+    return;
+  }
+
+  await closeThreadByChannelId(interaction.channelID);
+  await sendUserEmbed(thread.userId, "Thread Closed", "Your modmail thread has been closed. If you need anything else, feel free to DM me again.");
+
+  await interaction.createMessage({ embeds: [createEmbed("Thread Closed", `Thread #${thread.id} has been closed and the user has been notified. \n\n⚠ This channel will be deleted in 60 seconds.`)] });
+
+  setInterval(async () => {
+    await interaction.channel.delete();
+  }, 60000);
+}
+
+client.once("ready", () => {
+  client.editStatus("online", [{ name: "your smile (ღゝ◡╹)ノ♡", type: ActivityTypes.WATCHING }]);
   console.log(`Logged in as ${client.user.tag}`);
+});
+
+client.on("messageCreate", async (message) => {
+  try {
+    if (message.author.bot || message.webhookID) return;
+
+    const isDm = !message.guildID;
+    if (!isDm) return;
+
+    const attachments = Array.from(message.attachments.values()).map((attachment) => ({
+      url: attachment.url,
+      filename: attachment.filename
+    }));
+
+    const openThread = await getOpenThreadByUserId(message.author.id);
+    if (openThread) {
+      await forwardUserMessageToThread(message.author.id, message.author.tag, message.content ?? "", attachments);
+      return;
+    }
+
+    const existingPending = pendingConfirmations.get(message.author.id);
+    if (existingPending) {
+      existingPending.messages.push({ content: message.content ?? "", attachments });
+      await message.author.createDM().then(channel => {
+        channel.createMessage({
+          embeds: [createEmbed("Pending Confirmation", "Your message is queued, but you still need to press **Accept** before it is sent to the staff team.")]
+        })
+      });
+      return;
+    }
+
+    pendingConfirmations.set(message.author.id, {
+      userId: message.author.id,
+      username: message.author.tag,
+      messages: [{ content: message.content ?? "", attachments }]
+    });
+
+    await message.author.createDM().then(channel => {
+      channel.createMessage({
+        embeds: [createEmbed("Contact Staff Team", "You are about to contact the staff team. Press **Accept** to create a modmail thread or **Deny** to cancel.")],
+        components: [
+          {
+            type: 1,
+            components: [
+              { type: 2, style: 3, label: "Accept", customID: CONFIRM_ACCEPT_ID },
+              { type: 2, style: 4, label: "Deny", customID: CONFIRM_DENY_ID }
+            ]
+          }
+        ]
+      })
+    });
+
+  } catch (error) {
+    console.error("messageCreate error", error);
+  }
 });
 
 client.on("interactionCreate", async (interaction) => {
   try {
+    if (interaction.type === InteractionTypes.MESSAGE_COMPONENT) {
+      const componentInteraction = interaction as ComponentInteraction;
+      if (!componentInteraction.isButtonComponentInteraction()) return;
+
+      const pending = pendingConfirmations.get(componentInteraction.user.id);
+      if (!pending) {
+        await componentInteraction.createMessage({ embeds: [createEmbed("Modmail", "This confirmation is no longer valid. Please DM me again.")], flags: 64 });
+        return;
+      }
+
+      if (componentInteraction.data.customID === CONFIRM_DENY_ID) {
+        pendingConfirmations.delete(componentInteraction.user.id);
+        await componentInteraction.message.edit({
+          components: [
+            {
+              type: 1,
+              components: [
+                { type: 2, style: 3, label: "Accept", customID: CONFIRM_ACCEPT_ID, disabled: true },
+                { type: 2, style: 4, label: "Deny", customID: CONFIRM_DENY_ID, disabled: true }
+              ]
+            }
+          ]
+        });
+        await componentInteraction.createMessage({ embeds: [createEmbed("Thread Cancelled", "Your modmail thread has been cancelled.")] });
+        return;
+      }
+
+      if (componentInteraction.data.customID === CONFIRM_ACCEPT_ID) {
+        pendingConfirmations.delete(componentInteraction.user.id);
+        for (const queuedMessage of pending.messages) {
+          await forwardUserMessageToThread(pending.userId, pending.username, queuedMessage.content, queuedMessage.attachments);
+        }
+        await componentInteraction.message.edit({
+          components: [
+            {
+              type: 1,
+              components: [
+                { type: 2, style: 3, label: "Accept", customID: CONFIRM_ACCEPT_ID, disabled: true },
+                { type: 2, style: 4, label: "Deny", customID: CONFIRM_DENY_ID, disabled: true }
+              ]
+            }
+          ]
+        });
+        await componentInteraction.createMessage({ embeds: [createEmbed("Thread Created", "Your modmail thread has been created. Please continue chatting here and the staff team will receive your messages.")] });
+        return;
+      }
+
+      return;
+    }
+
     if (interaction.type !== InteractionTypes.APPLICATION_COMMAND || !interaction.isChatInputCommand()) return;
 
     if (interaction.data.name === "ping") {
-      await interaction.createMessage({ content: `pong! ${client.shards.get(0)?.latency ?? 0}ms`, flags: 64 });
+      await interaction.createMessage({ embeds: [createEmbed("Pong!", `${client.shards.get(0)?.latency ?? 0}ms`)], flags: 64 });
       return;
     }
 
@@ -30,14 +317,26 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [{
           title: `${client.user.username}`,
           description: "i am a discord bot to help within the VoidChan ecosystem!",
+          color: 0x9b87f5
         }],
         flags: 64
       });
+      return;
+    }
+
+    if (interaction.data.name === "reply") {
+      await handleReplyCommand(interaction);
+      return;
+    }
+
+    if (interaction.data.name === "close") {
+      await handleCloseCommand(interaction);
+      return;
     }
   } catch (error) {
     console.error("interactionCreate error", error);
     if (!interaction.acknowledged) {
-      await (interaction as CommandInteraction).createMessage({ content: "something went wrong.", flags: 64 });
+      await (interaction as CommandInteraction).createMessage({ embeds: [createEmbed("Error", "Something went wrong.")], flags: 64 });
     }
   }
 });
@@ -172,6 +471,7 @@ app.get("/auth/github/callback", async (req, res) => {
 });
 
 async function start() {
+  await initializeModmailStore();
   await client.connect();
   app.listen(config.port, () => {
     console.log(`Web server listening on ${config.baseUrl}`);

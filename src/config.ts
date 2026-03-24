@@ -15,6 +15,7 @@ export const config = {
   discordClientSecret: requireEnv("DISCORD_CLIENT_SECRET"),
   guildId: requireEnv("DISCORD_GUILD_ID"),
   contributorRoleId: requireEnv("CONTRIBUTOR_ROLE_ID"),
+  modmailCategoryId: requireEnv("MODMAIL_CATEGORY_ID"),
   discordRedirectUri: requireEnv("DISCORD_REDIRECT_URI"),
   githubClientId: requireEnv("GITHUB_CLIENT_ID"),
   githubClientSecret: requireEnv("GITHUB_CLIENT_SECRET"),
