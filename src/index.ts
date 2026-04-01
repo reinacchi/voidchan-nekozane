@@ -198,6 +198,10 @@ client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
+client.on("error", (error) => {
+  console.error("Client error", error);
+});
+
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot || message.webhookID) return;
